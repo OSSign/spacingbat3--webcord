@@ -78,7 +78,7 @@ jobs:
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
 
-      - uses: actions/setup-node@v4                              # [CHANGE ME] upstream uses 24.x on Windows
+      - uses: actions/setup-node@v6                              # [CHANGE ME] upstream uses 24.x on Windows
         with:
           node-version: "24.x"
           cache: npm
@@ -170,7 +170,10 @@ jobs:
       - name: Build and sign with Electron Forge
         working-directory: src
         run: |
-          npm run make -- --platform win32 --arch x64,arm64
+          # This hopefully fixes the race that is fixed with retries in the upstream
+          for arch in x64 arm64; do                                                                                                                                                                                                                                           
+            npm run make -- --platform win32 --arch "$arch"                                                                                                                                                                                                                   
+          done
           for f in out/release/make/squirrel.windows/*/*.msi; do
             ossign verify "$f" || ossign -t msi -o "$f" "$f"
           done
