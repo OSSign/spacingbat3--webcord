@@ -95,7 +95,9 @@ jobs:
           config: |
             { "tokenType": "ossignServer",
               "ossignServer": { "url": "${{ env.OSSIGN_SERVER }}", "key": "${{ env.OSSIGN_KEY }}",
-                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } } }
+                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } },
+              "timestampUrl": "http://timestamp.acs.microsoft.com/tsa/advanced",
+              "msTimestampUrl": "http://timestamp.acs.microsoft.com/tsa" }
 
       - name: Install dependencies                               # [CHANGE ME]
         working-directory: src
