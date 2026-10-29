@@ -1,0 +1,212 @@
+# Signing workflow for OSSign/spacingbat3--webcord (source: SpacingBat3/WebCord).
+#
+# WebCord builds with Electron Forge, not electron-builder. The Windows
+# outputs mirror upstream's release.yml (Windows, x64 + arm64): the ZIP maker
+# and the Squirrel maker (Setup .exe and .msi).
+#
+# Signing follows the ossign/adolfintel-flogo approach: @ossign/ossign is
+# installed next to the source and a hook in ./ossign calls
+# GetElectronForgeSignerFunction for every file. Forge hands the hook to
+# @electron/windows-sign through packagerConfig.windowsSign (app executable,
+# DLLs, .node files) and to the Squirrel maker through its windowsSign option
+# (Setup.exe and the files inside the nupkg). The hook and a wrapper Forge
+# config live in this workflow, so the third party's source cannot change
+# what gets signed.
+#
+#   [DO NOT CHANGE]  the server or the review depends on it; keep it as is
+#   [CHANGE ME]     project specific; replace freely
+#   [OPTIONAL]  can be removed without affecting the server
+
+name: Sign release
+
+run-name: "Sign ${{ inputs.ref }} [${{ inputs.dispatch_id }}]"      # [DO NOT CHANGE]
+
+on:                                                                 # [DO NOT CHANGE] all four inputs
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of the source repository as requested
+        required: true
+      sha:
+        description: Commit pinned by ossign-server; the build uses this, never the moving ref
+        required: true
+      release_name:
+        description: Name of the GitHub release to publish
+        required: true
+      dispatch_id:
+        description: Dispatch id assigned by ossign-server
+        required: true
+
+env:
+  # [DO NOT CHANGE] Repository variables. SOURCE_REPO and OSSIGN_SERVER are set
+  # automatically during onboarding; add OSSIGN_KEY (the key name on the
+  # server) under Settings → Secrets and variables → Actions → Variables.
+  SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+  OSSIGN_SERVER: ${{ vars.OSSIGN_SERVER }}
+  OSSIGN_KEY: ${{ vars.OSSIGN_KEY }}
+
+# [DO NOT CHANGE] id-token: write gives the job its OIDC token (signing and the report fetch).
+# contents: write is only needed by the release step at the bottom.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # The review scans the pinned commit on the server (the ossign-scanner
+  # service) before this job's environment is released, so the workflow has
+  # no scanning job of its own.
+
+  sign:
+    runs-on: windows-latest                                      # [CHANGE ME] Squirrel installers build on Windows
+    environment: signing                                         # [DO NOT CHANGE]
+    defaults:
+      run:
+        shell: bash
+    env:
+      # [CHANGE ME] Always a release build. Upstream's devel builds turn on the
+      # RunAsNode, NODE_OPTIONS and inspect fuses, which must never ship in a
+      # signed binary (a signed exe that runs arbitrary JS). This also puts the
+      # output under out/release.
+      WEBCORD_BUILD: release
+    steps:
+      - name: Check out the pinned source commit                 # [DO NOT CHANGE]
+        run: |
+          git init src
+          cd src
+          git remote add origin "$SOURCE_REPO"
+          git fetch --depth 1 origin "${{ inputs.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+
+      - uses: actions/setup-node@v4                              # [CHANGE ME] upstream uses 24.x on Windows
+        with:
+          node-version: "24.x"
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      # [DO NOT CHANGE] Install the CLI and write its configuration once. Nothing is
+      # signed here; Forge does that through the hook below. The CLI authenticates
+      # with the job's OIDC token, so no secret is involved.
+      - name: Install ossign
+        id: ossign
+        uses: ossign/ossign@1.3.1
+        with:
+          installOnly: true
+          config: |
+            { "tokenType": "ossignServer",
+              "ossignServer": { "url": "${{ env.OSSIGN_SERVER }}", "key": "${{ env.OSSIGN_KEY }}",
+                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } } }
+
+      - name: Install dependencies                               # [CHANGE ME]
+        working-directory: src
+        run: |
+          npm ci
+          # Not saved to package.json, so packaging prunes it from the app.
+          npm install --no-save @ossign/ossign@1.3.1
+
+      # [DO NOT CHANGE] The sign hook and the Forge config that wires it in.
+      # @electron/windows-sign calls the hook with the path of each file and
+      # only logs a failure, so the verify step below is what fails the job.
+      # The CLI reads the config the action wrote to its default path.
+      - name: Write the sign hook and the Forge wrapper config
+        working-directory: src
+        run: |
+          mkdir -p ossign
+          cat > ossign/sign.cjs <<'JS'
+          const path = require("node:path");
+          const { GetElectronForgeSignerFunction } = require("@ossign/ossign");
+
+          const signers = {
+            msi: GetElectronForgeSignerFunction("msi"),
+            pecoff: GetElectronForgeSignerFunction("pecoff"),
+          };
+
+          module.exports = async function sign(file) {
+            const type = path.extname(file).toLowerCase() === ".msi" ? "msi" : "pecoff";
+            console.log(`[ossign] signing ${file} (${type})`);
+            try {
+              await signers[type](file);
+            } catch (error) {
+              console.error(`[ossign] signing failed for ${file}:`, error);
+              throw error;
+            }
+          };
+          JS
+
+          cat > ossign/forge.mjs <<'JS'
+          // Upstream's config (compiled by tsc in `npm run make`) plus signing.
+          import { resolve, dirname } from "node:path";
+          import { fileURLToPath } from "node:url";
+          import base from "../app/code/build/forge.mjs";
+
+          const windowsSign = { hookModulePath: resolve(dirname(fileURLToPath(import.meta.url)), "sign.cjs") };
+
+          for (const maker of base.makers) {
+            if (maker.name !== "squirrel") continue;
+            const fetcher = maker.configOrConfigFetcher;
+            maker.configOrConfigFetcher = async (arch) => ({
+              ...(typeof fetcher === "function" ? await fetcher(arch) : fetcher),
+              windowsSign,
+            });
+          }
+
+          export default {
+            ...base,
+            packagerConfig: {
+              ...base.packagerConfig,
+              windowsSign,
+              ignore: [...(base.packagerConfig.ignore ?? []), /^\/ossign(?:\/|$)/],
+            },
+          };
+          JS
+
+          npm pkg set config.forge=./ossign/forge.mjs
+
+      # [CHANGE ME] The build, as upstream's release.yml does it for Windows.
+      # Squirrel does not reliably sign the .msi, so it is signed afterwards
+      # when it is not signed yet.
+      - name: Build and sign with Electron Forge
+        working-directory: src
+        run: |
+          npm run make -- --platform win32 --arch x64,arm64
+          for f in out/release/make/squirrel.windows/*/*.msi; do
+            ossign verify "$f" || ossign -t msi -o "$f" "$f"
+          done
+
+      # [DO NOT CHANGE] The hook cannot fail the build on its own (see above), so
+      # refuse to publish if anything is unsigned, test-mode signed or signed by
+      # the wrong certificate.
+      - name: Verify signatures
+        working-directory: src
+        run: |
+          shopt -s nullglob
+          files=(out/release/make/squirrel.windows/*/*.exe out/release/make/squirrel.windows/*/*.msi out/release/*-win32-*/*.exe)
+          test ${#files[@]} -gt 0
+          for f in "${files[@]}"; do ossign verify "$f"; done
+
+      # [RECOMMENDED] Fetch the review report bundle so it can be published next
+      # to the binaries.
+      - name: Fetch the review report
+        run: |
+          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OSSIGN_SERVER" | jq -r .value)
+          mkdir -p review
+          for f in review-report.json review-report.md review-scans.zip review-report.json.p7s; do
+            curl -sS --fail -H "Authorization: Bearer $OIDC" -o "review/$f" \
+              "$OSSIGN_SERVER/api/v1/reviews/${{ inputs.dispatch_id }}/report/$f"
+          done
+
+      # [OPTIONAL] File names carry the architecture, so x64 and arm64 do not
+      # collide. The Squirrel RELEASES/nupkg update feed is left out: both
+      # architectures write a file called RELEASES.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.ref }}-${{ github.run_number }}
+          name: ${{ inputs.release_name }}
+          body_path: review/review-report.md
+          files: |
+            src/out/release/make/squirrel.windows/*/*.exe
+            src/out/release/make/squirrel.windows/*/*.msi
+            src/out/release/make/zip/win32/*/*.zip
+            review/*
