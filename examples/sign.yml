@@ -1,0 +1,170 @@
+# Signing workflow template. Move it to .github/workflows/sign.yml
+# once the initial review is approved, then adapt the build and
+# the signing steps.
+#
+# Mirror repository workflow for an Electron app packaged with electron-builder.
+#
+# Same contract as mirror-signing.yml (read the markers there): the server
+# dispatches this workflow with ref/sha/release_name/dispatch_id, the review
+# gates the "sign" job through the "signing" environment, and the run title
+# carries the dispatch id. The difference is how signing happens: the ossign
+# action only installs the CLI and its configuration (installOnly), and
+# electron-builder calls the CLI itself for every file it produces, through a
+# small sign hook written below. That covers the app executable, the
+# uninstaller and the NSIS installer in one build.
+#
+#   [DO NOT CHANGE]  the server or the review depends on it; keep it as is
+#   [CHANGE ME]     project specific; replace freely
+#   [OPTIONAL]  can be removed without affecting the server
+
+name: Sign release
+
+run-name: "Sign ${{ inputs.ref }} [${{ inputs.dispatch_id }}]"      # [DO NOT CHANGE]
+
+on:                                                                 # [DO NOT CHANGE] all four inputs
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of the source repository as requested
+        required: true
+      sha:
+        description: Commit pinned by ossign-server; the build uses this, never the moving ref
+        required: true
+      release_name:
+        description: Name of the GitHub release to publish
+        required: true
+      dispatch_id:
+        description: Dispatch id assigned by ossign-server
+        required: true
+
+env:
+  # [DO NOT CHANGE] Repository variables. SOURCE_REPO and OSSIGN_SERVER are set
+  # automatically during onboarding; add OSSIGN_KEY (the key name on the
+  # server) under Settings → Secrets and variables → Actions → Variables.
+  SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+  OSSIGN_SERVER: ${{ vars.OSSIGN_SERVER }}
+  OSSIGN_KEY: ${{ vars.OSSIGN_KEY }}
+
+# [DO NOT CHANGE] id-token: write gives the job its OIDC token (signing and the report fetch).
+# contents: write is only needed by the release step at the bottom.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # The review scans the pinned commit on the server (the ossign-scanner
+  # service) before this job's environment is released, so the workflow has
+  # no scanning job of its own. Which scanners run is part of the review
+  # rule, not of this file.
+
+  sign:
+    runs-on: windows-latest                                      # [CHANGE ME] NSIS installers build on Windows
+    environment: signing                                         # [DO NOT CHANGE]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the pinned source commit                 # [DO NOT CHANGE]
+        run: |
+          git init src
+          cd src
+          git remote add origin "$SOURCE_REPO"
+          git fetch --depth 1 origin "${{ inputs.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+
+      - uses: actions/setup-node@v4                              # [CHANGE ME]
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      # [DO NOT CHANGE] Install the CLI and write its configuration once. Nothing is
+      # signed here; electron-builder does that through the hook below. The
+      # config lands in the user's ossign config directory, which the CLI reads
+      # by default, so the hook needs no path. This step and every later ossign
+      # call still need the OIDC token, i.e. id-token: write on the job.
+      - name: Install ossign
+        id: ossign
+        uses: ossign/ossign@1.3.1
+        with:
+          installOnly: true
+          config: |
+            { "tokenType": "ossignServer",
+              "ossignServer": { "url": "${{ env.OSSIGN_SERVER }}", "key": "${{ env.OSSIGN_KEY }}",
+                                "metadata": { "dispatch": "${{ inputs.dispatch_id }}", "sha": "${{ inputs.sha }}" } } }
+
+      # [DO NOT CHANGE] The sign hook electron-builder calls for each PE file: the
+      # app executable, the uninstaller and the installer. It runs the ossign
+      # CLI in place. Kept in the mirror repository's workflow, not in the
+      # third party's source, so they cannot change what gets signed.
+      - name: Write the electron-builder sign hook
+        run: |
+          cat > ossign-sign.js <<'JS'
+          // electron-builder custom sign hook. Called once per file to sign.
+          // `configuration.path` is the file; signing happens in place.
+          const { execFileSync } = require("node:child_process");
+          const path = require("node:path");
+
+          module.exports = async function sign(configuration) {
+            const file = configuration.path;
+            const type = path.extname(file).toLowerCase() === ".msi" ? "msi" : "pecoff";
+            console.log(`ossign: signing ${file} (${type})`);
+            execFileSync(process.platform === "win32" ? "ossign.exe" : "ossign",
+              ["-t", type, "-o", file, file], { stdio: "inherit" });
+          };
+          JS
+
+      - name: Install dependencies                               # [CHANGE ME]
+        working-directory: src
+        run: npm ci
+
+      # [CHANGE ME] The build. What must stay: the sign hook wired into
+      # electron-builder and CSC_IDENTITY_AUTO_DISCOVERY=false so it does not
+      # look for a local certificate. electron-builder 26 and later use
+      # win.signtoolOptions.sign; versions before 26 use win.sign instead.
+      # Passing the hook on the command line means the third party's own
+      # electron-builder config cannot override it.
+      - name: Build and sign with electron-builder
+        working-directory: src
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ""                                           # keep electron-builder from publishing on its own
+        run: |
+          npx electron-builder --win --x64 --publish never \
+            -c.win.signtoolOptions.sign="${GITHUB_WORKSPACE//\\//}/ossign-sign.js" \
+            -c.win.signAndEditExecutable=true
+
+      # [OPTIONAL] Refuse to publish if anything is unsigned, test-mode signed
+      # or signed by the wrong certificate.
+      - name: Verify signatures
+        run: |
+          for f in src/dist/*.exe; do ossign verify "$f"; done
+
+      # [RECOMMENDED] Fetch the review report bundle (available once the review
+      # is decided, which it is by the time this job runs) so it can be
+      # published next to the binaries: review-report.json (full report),
+      # review-report.md (summary, used as the release body),
+      # review-scans.zip (raw scanner output) and review-report.json.p7s
+      # (detached signature over the JSON, made with this repository's key).
+      - name: Fetch the review report
+        run: |
+          OIDC=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OSSIGN_SERVER" | jq -r .value)
+          mkdir -p review
+          for f in review-report.json review-report.md review-scans.zip review-report.json.p7s; do
+            curl -sS --fail -H "Authorization: Bearer $OIDC" -o "review/$f" \
+              "$OSSIGN_SERVER/api/v1/reviews/${{ inputs.dispatch_id }}/report/$f"
+          done
+
+      - name: Publish release                                    # [OPTIONAL] report summary as body, report files attached
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.ref }}-${{ github.run_number }}
+          name: ${{ inputs.release_name }}
+          body_path: review/review-report.md
+          files: |
+            src/dist/*.exe
+            src/dist/*.blockmap
+            src/dist/latest.yml
+            review/*
